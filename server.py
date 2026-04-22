@@ -1,173 +1,103 @@
-#!/usr/bin/env python3
-"""
-Umbrel Share - Backend
-Sirve el frontend y expone una API para explorar y descargar archivos del servidor.
-"""
-
-import os
-import json
-import mimetypes
+import os, json, mimetypes
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, unquote
-import jwt as pyjwt
+from urllib.parse import urlparse, parse_qs
 
-# ── Config ────────────────────────────────────────────────────────────────────
-PORT = int(os.environ.get("PORT", 3000))
-SERVE_ROOT = os.environ.get("SERVE_ROOT", "/data")       # Volumen montado en Docker
-UMBREL_JWT_SECRET = os.environ.get("UMBREL_JWT_SECRET", "")  # Secret para validar JWT
-HIDDEN_DIRS = set(os.environ.get("HIDDEN_DIRS", "umbrel,.ssh,secrets,postgres,.git").split(","))
-FRONTEND_DIR = Path(__file__).parent / "static"
+PORT        = int(os.environ.get('PORT', 3005))
+SERVE_ROOT  = os.environ.get('SERVE_ROOT', '/data')
+PASSWORD    = os.environ.get('APP_PASSWORD', 'umbrel')
+HIDDEN_DIRS = set(os.environ.get('HIDDEN_DIRS', 'umbrel,.ssh,secrets,postgres,.git,.config,lost+found').split(','))
+STATIC_DIR  = Path('/app/static')
 
-# ── JWT Validation ─────────────────────────────────────────────────────────────
-def validate_jwt(token: str) -> bool:
-    """
-    Valida el JWT de Umbrel.
-    Si no tenemos el secret configurado, hacemos decode sin verificar firma
-    (modo permisivo — para usar solo en red local).
-    """
-    if not token:
-        return False
-    try:
-        if UMBREL_JWT_SECRET:
-            pyjwt.decode(token, UMBREL_JWT_SECRET, algorithms=["HS256"])
-        else:
-            # Sin secret: decodificamos sin verificar (solo red local)
-            pyjwt.decode(token, options={"verify_signature": False})
-        return True
-    except Exception:
-        return False
+def check_password(pwd):
+    return pwd == PASSWORD
 
-def extract_token(handler) -> str:
-    auth = handler.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        return auth[7:]
-    return ""
+def extract_token(h):
+    a = h.headers.get('Authorization','')
+    return a[7:] if a.startswith('Bearer ') else ''
 
-# ── File helpers ───────────────────────────────────────────────────────────────
-def safe_path(requested: str) -> Path | None:
-    """Resuelve la ruta y se asegura de que esté dentro de SERVE_ROOT."""
+def safe_path(req):
     root = Path(SERVE_ROOT).resolve()
-    target = (root / requested.lstrip("/")).resolve()
-    if not str(target).startswith(str(root)):
-        return None
-    return target
+    t = (root / req.lstrip('/')).resolve()
+    return t if str(t).startswith(str(root)) else None
 
-def list_dir(path: Path) -> list:
+def list_dir(path):
     items = []
     try:
-        for entry in sorted(path.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
-            if entry.name.startswith("."):
-                continue
-            if entry.is_dir() and entry.name in HIDDEN_DIRS:
-                continue
-            rel = "/" + str(entry.relative_to(Path(SERVE_ROOT).resolve()))
-            item = {
-                "name": entry.name,
-                "path": rel,
-                "type": "dir" if entry.is_dir() else "file",
-            }
-            if entry.is_file():
-                try:
-                    item["size"] = entry.stat().st_size
-                except Exception:
-                    item["size"] = 0
+        for e in sorted(path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+            if e.name.startswith('.') or (e.is_dir() and e.name in HIDDEN_DIRS): continue
+            rel = '/' + str(e.relative_to(Path(SERVE_ROOT).resolve()))
+            item = {'name': e.name, 'path': rel, 'type': 'dir' if e.is_dir() else 'file'}
+            if e.is_file():
+                try: item['size'] = e.stat().st_size
+                except: item['size'] = 0
             items.append(item)
-    except PermissionError:
-        pass
+    except PermissionError: pass
     return items
 
-# ── HTTP Handler ───────────────────────────────────────────────────────────────
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        print(f"[{self.address_string()}] {format % args}")
+class H(BaseHTTPRequestHandler):
+    def log_message(self, f, *a): print(f'[{self.address_string()}] {f%a}')
 
-    def send_json(self, data, status=200):
-        body = json.dumps(data).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", len(body))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def send_error_json(self, msg, status=403):
-        self.send_json({"error": msg}, status)
+    def json(self, d, s=200):
+        b = json.dumps(d).encode()
+        self.send_response(s)
+        self.send_header('Content-Type','application/json')
+        self.send_header('Content-Length',len(b))
+        self.send_header('Access-Control-Allow-Origin','*')
+        self.end_headers(); self.wfile.write(b)
 
     def do_OPTIONS(self):
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header('Access-Control-Allow-Origin','*')
+        self.send_header('Access-Control-Allow-Headers','Authorization,Content-Type')
         self.end_headers()
 
+    def do_POST(self):
+        p = urlparse(self.path)
+        if p.path == '/api/login':
+            length = int(self.headers.get('Content-Length', 0))
+            body = json.loads(self.rfile.read(length))
+            pwd = body.get('password','')
+            if check_password(pwd):
+                return self.json({'ok': True})
+            return self.json({'ok': False, 'error': 'Contraseña incorrecta'}, 401)
+        self.send_response(404); self.end_headers()
+
     def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
-        qs = parse_qs(parsed.query)
+        p = urlparse(self.path); qs = parse_qs(p.query)
 
-        # ── API: list files ──────────────────────────────────────────────────
-        if path == "/api/files":
-            token = extract_token(self)
-            if not validate_jwt(token):
-                return self.send_error_json("Unauthorized", 401)
+        if p.path == '/api/files':
+            if not check_password(extract_token(self)):
+                return self.json({'error':'Unauthorized'},401)
+            t = safe_path(qs.get('path',['/'])[0])
+            if not t or not t.exists() or not t.is_dir(): return self.json({'error':'Not found'},404)
+            return self.json(list_dir(t))
 
-            req_path = qs.get("path", ["/"])[0]
-            target = safe_path(req_path)
-            if not target or not target.exists() or not target.is_dir():
-                return self.send_error_json("Not found", 404)
-
-            return self.send_json(list_dir(target))
-
-        # ── API: download file ───────────────────────────────────────────────
-        elif path == "/api/download":
-            token = extract_token(self)
-            if not validate_jwt(token):
-                return self.send_error_json("Unauthorized", 401)
-
-            req_path = qs.get("path", [""])[0]
-            target = safe_path(req_path)
-            if not target or not target.exists() or not target.is_file():
-                return self.send_error_json("Not found", 404)
-
-            mime, _ = mimetypes.guess_type(str(target))
-            mime = mime or "application/octet-stream"
-            size = target.stat().st_size
-
+        elif p.path == '/api/download':
+            if not check_password(extract_token(self)):
+                return self.json({'error':'Unauthorized'},401)
+            t = safe_path(qs.get('path',[''])[0])
+            if not t or not t.exists() or not t.is_file(): return self.json({'error':'Not found'},404)
+            mime,_ = mimetypes.guess_type(str(t)); mime = mime or 'application/octet-stream'
             self.send_response(200)
-            self.send_header("Content-Type", mime)
-            self.send_header("Content-Length", size)
-            self.send_header("Content-Disposition", f'attachment; filename="{target.name}"')
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header('Content-Type',mime)
+            self.send_header('Content-Length',t.stat().st_size)
+            self.send_header('Content-Disposition',f'attachment; filename="{t.name}"')
+            self.send_header('Access-Control-Allow-Origin','*')
             self.end_headers()
+            with open(t,'rb') as f:
+                while chunk := f.read(65536): self.wfile.write(chunk)
 
-            with open(target, "rb") as f:
-                while chunk := f.read(65536):
-                    self.wfile.write(chunk)
-
-        # ── Static files ─────────────────────────────────────────────────────
         else:
-            file_path = FRONTEND_DIR / ("index.html" if path == "/" else path.lstrip("/"))
-            if not file_path.exists():
-                file_path = FRONTEND_DIR / "index.html"
-
-            if file_path.exists():
-                mime, _ = mimetypes.guess_type(str(file_path))
-                mime = mime or "text/html"
-                content = file_path.read_bytes()
+            fp = STATIC_DIR / ('index.html' if p.path=='/' else p.path.lstrip('/'))
+            if not fp.exists(): fp = STATIC_DIR / 'index.html'
+            if fp.exists():
+                mime,_ = mimetypes.guess_type(str(fp)); c = fp.read_bytes()
                 self.send_response(200)
-                self.send_header("Content-Type", mime)
-                self.send_header("Content-Length", len(content))
-                self.end_headers()
-                self.wfile.write(content)
-            else:
-                self.send_response(404)
-                self.end_headers()
+                self.send_header('Content-Type', mime or 'text/html')
+                self.send_header('Content-Length',len(c))
+                self.end_headers(); self.wfile.write(c)
+            else: self.send_response(404); self.end_headers()
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    print(f"🚀 Umbrel Share backend corriendo en http://0.0.0.0:{PORT}")
-    print(f"📁 Sirviendo archivos desde: {SERVE_ROOT}")
-    print(f"🙈 Carpetas ocultas: {HIDDEN_DIRS}")
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    server.serve_forever()
+print(f'🚀 Umbrel Share en http://0.0.0.0:{PORT}')
+HTTPServer(('0.0.0.0', PORT), H).serve_forever()
