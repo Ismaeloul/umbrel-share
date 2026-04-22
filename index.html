@@ -272,7 +272,7 @@ async function uploadItem(item){
     const fd=new FormData();
     fd.append('file',blob,item.name);
     document.getElementById(`prog-${item.id}`).style.width='30%';
-    const upRes=await fetch(`https://store${server}.gofile.io/contents/uploadfile`,{method:'POST',body:fd});
+    const upRes=await fetch(`https://${server}.gofile.io/contents/uploadfile`,{method:'POST',body:fd});
     document.getElementById(`prog-${item.id}`).style.width='90%';
     const upData=await upRes.json();
     if(upData.status!=='ok')throw new Error();
